@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	fhirversion "github.com/google/fhir/go/fhirversion"
 	jsonformat "github.com/google/fhir/go/jsonformat"
@@ -159,16 +161,72 @@ func handlePatientByID(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		patientStoreMu.RLock()
-		data, ok := patientStore[id]
-		patientStoreMu.RUnlock()
-		if !ok {
-			writeSimpleOutcome(w, http.StatusNotFound, "Patient not found")
+		// Proxy the GET to the external BE endpoint instead of in-memory store
+		beURL := "https://dev.cloudsolutions.com.sa/csi-api/csi-net-empiread/api/patient/" + id + "?includeClosed=true"
+		// Custom transport to mirror curl -k (insecure TLS) for dev environment
+		transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		client := &http.Client{Timeout: 15 * time.Second, Transport: transport}
+		req, err := http.NewRequest(http.MethodGet, beURL, nil)
+		if err != nil {
+			writeSimpleOutcome(w, http.StatusBadGateway, "failed to build backend request")
 			return
 		}
-		w.Header().Set("Content-Type", "application/fhir+json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
+		// Forward important headers; use sensible defaults if missing to match provided curl
+		accept := r.Header.Get("Accept")
+		if accept == "" {
+			accept = "application/json, text/plain, */*"
+		}
+		req.Header.Set("Accept", accept)
+		if v := r.Header.Get("Accept-Language"); v != "" {
+			req.Header.Set("Accept-Language", v)
+		}
+		if v := r.Header.Get("Referer"); v != "" {
+			req.Header.Set("Referer", v)
+		}
+		ua := r.Header.Get("User-Agent")
+		if ua == "" {
+			ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+		}
+		req.Header.Set("User-Agent", ua)
+		// Required X-* headers for BE
+		setOrDefault := func(name, def string) {
+			if v := r.Header.Get(name); v != "" {
+				req.Header.Set(name, v)
+			} else if def != "" {
+				req.Header.Set(name, def)
+			}
+		}
+		setOrDefault("X-Group", "58")
+		setOrDefault("X-Hospital", "59")
+		setOrDefault("X-Location", "59")
+		setOrDefault("X-Module", "empi")
+		setOrDefault("X-User", "8008")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("backend request error: %v", err)
+			writeSimpleOutcome(w, http.StatusBadGateway, "backend service unavailable")
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			writeSimpleOutcome(w, http.StatusBadGateway, "failed to read backend response")
+			return
+		}
+		// Pass through status code. On 404, map to OperationOutcome for consistency.
+		if resp.StatusCode == http.StatusNotFound {
+			writeSimpleOutcome(w, http.StatusNotFound, "Patient not found in backend")
+			return
+		}
+		// Forward body with JSON content type by default.
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/json"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
 		return
 
 	case http.MethodPut:
