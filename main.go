@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -219,7 +220,28 @@ func handlePatientByID(w http.ResponseWriter, r *http.Request) {
 			writeSimpleOutcome(w, http.StatusNotFound, "Patient not found in backend")
 			return
 		}
-		// Forward body with JSON content type by default.
+		// If backend succeeded, transform to FHIR Patient.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			fhirJSON, err := transformBackendToFHIRPatient(body, id)
+			if err != nil {
+				log.Printf("transform to FHIR failed: %v", err)
+				writeSimpleOutcome(w, http.StatusBadGateway, "failed to transform backend response to FHIR Patient")
+				return
+			}
+			// Validate the generated Patient against FHIR R4 before returning
+			if ok, _, vErr := validatePatientR4(fhirJSON); vErr != nil || !ok {
+				if vErr != nil {
+					log.Printf("generated Patient failed FHIR validation: %v", vErr)
+				}
+				writeSimpleOutcome(w, http.StatusBadGateway, "generated Patient failed FHIR R4 validation")
+				return
+			}
+			w.Header().Set("Content-Type", "application/fhir+json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fhirJSON)
+			return
+		}
+		// Non-successful statuses: forward body/status as-is
 		ct := resp.Header.Get("Content-Type")
 		if ct == "" {
 			ct = "application/json"
@@ -291,4 +313,242 @@ func handlePatientByID(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+}
+
+
+// transformBackendToFHIRPatient transforms the backend EMPI payload to a FHIR R4 Patient JSON.
+func transformBackendToFHIRPatient(beJSON []byte, pathID string) ([]byte, error) {
+	// If payload is already a FHIR Patient, return as-is.
+	if looksLikePatient(beJSON) {
+		return beJSON, nil
+	}
+	// Unwrap common envelope shapes: {"details": {...}} or {"data": "<json>"} or {"data": {...}}
+	var anyMap map[string]any
+	if err := json.Unmarshal(beJSON, &anyMap); err != nil {
+		return nil, err
+	}
+	payload := anyMap
+	if d, ok := anyMap["details"]; ok {
+		if m, ok := d.(map[string]any); ok {
+			payload = m
+		}
+	}
+	if d, ok := anyMap["data"]; ok {
+		switch v := d.(type) {
+		case string:
+			var inner map[string]any
+			if err := json.Unmarshal([]byte(v), &inner); err == nil {
+				payload = inner
+			}
+		case map[string]any:
+			payload = v
+		}
+	}
+	// If unwrapped content itself is FHIR Patient, return it.
+	if b, err := json.Marshal(payload); err == nil {
+		if looksLikePatient(b) {
+			return b, nil
+		}
+	}
+
+	// Assemble FHIR Patient map (best-effort mapping)
+	patient := map[string]any{
+		"resourceType": "Patient",
+		"id":           pathID,
+	}
+	// active
+	if s := str(payload, "fileStatus"); s != "" {
+		patient["active"] = strings.EqualFold(s, "active")
+	}
+	// identifier(s)
+	identifiers := make([]any, 0, 3)
+	if v := str(payload, "legacyMRN", "mrn", "medicalRecordNumber", "patientNumber"); v != "" {
+		identifiers = append(identifiers, map[string]any{"system": "urn:mrn", "value": v})
+	}
+	if v := str(payload, "upi", "patientId", "id"); v != "" {
+		identifiers = append(identifiers, map[string]any{"system": "urn:upi", "value": v})
+	}
+	if idType := str(payload, "idType"); idType != "" {
+		if idNum := str(payload, "idNumber"); idNum != "" {
+			identifiers = append(identifiers, map[string]any{"system": "urn:" + idType, "value": idNum})
+		}
+	}
+	if len(identifiers) > 0 {
+		patient["identifier"] = identifiers
+	}
+	// name
+	first := str(payload, "firstName", "givenName")
+	middle := str(payload, "middleName", "middle")
+	third := str(payload, "thirdName")
+	last := str(payload, "lastName", "familyName")
+	full := str(payload, "fullName")
+	givens := filterNonEmpty(first, middle, third)
+	name := map[string]any{}
+	if last != "" {
+		name["family"] = last
+	}
+	if len(givens) > 0 {
+		name["given"] = givens
+	}
+	if full != "" {
+		name["text"] = full
+	}
+	if len(name) > 0 {
+		patient["name"] = []any{name}
+	}
+	// gender
+	if gtxt := str(payload, "gender_text", "sex_text"); gtxt != "" {
+		patient["gender"] = normalizeGender(gtxt)
+	} else if g := str(payload, "gender", "sex"); g != "" {
+		patient["gender"] = normalizeGender(g)
+	}
+	// birthDate
+	if dob := str(payload, "dateOfBirth", "dob", "birthDate"); dob != "" {
+		patient["birthDate"] = normalizeDate(dob)
+	}
+	// deceasedBoolean
+	if db, ok := boolv(payload, "isDeceased", "deceased"); ok {
+		patient["deceasedBoolean"] = db
+	}
+	// telecom
+	telecom := make([]any, 0, 2)
+	if ph := str(payload, "mobileNumber", "phoneNumber", "phone"); ph != "" {
+		telecom = append(telecom, map[string]any{"system": "phone", "value": ph})
+	}
+	if em := str(payload, "email"); em != "" {
+		telecom = append(telecom, map[string]any{"system": "email", "value": em})
+	}
+	if len(telecom) > 0 {
+		patient["telecom"] = telecom
+	}
+	// address
+	addr := map[string]any{}
+	lines := filterNonEmpty(str(payload, "street", "addressLine1"))
+	if len(lines) > 0 {
+		addr["line"] = lines
+	}
+	if city := str(payload, "city"); city != "" {
+		addr["city"] = city
+	}
+	if state := str(payload, "state", "region", "area"); state != "" {
+		addr["state"] = state
+	}
+	if pc := str(payload, "zipCode", "postalCode"); pc != "" {
+		addr["postalCode"] = pc
+	}
+	if country := str(payload, "country"); country != "" {
+		addr["country"] = strings.ToUpper(country)
+	}
+	if len(addr) > 0 {
+		patient["address"] = []any{addr}
+	}
+
+	raw, err := json.Marshal(patient)
+	if err != nil {
+		return nil, err
+	}
+	// Produce canonical FHIR JSON via google/fhir and implicit validation
+	canonical, err := normalizeViaGoogleFHIR(raw)
+	if err != nil {
+		return nil, fmt.Errorf("google/fhir normalization failed: %w", err)
+	}
+	return canonical, nil
+}
+
+// Helper: get first non-empty string from keys
+func str(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch t := v.(type) {
+			case string:
+				if strings.TrimSpace(t) != "" && t != "-" && t != "null" {
+					return t
+				}
+			case float64:
+				return strconv.FormatInt(int64(t), 10)
+			case json.Number:
+				return t.String()
+			}
+		}
+	}
+	return ""
+}
+
+func boolv(m map[string]any, keys ...string) (bool, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch t := v.(type) {
+			case bool:
+				return t, true
+			case string:
+				lower := strings.ToLower(strings.TrimSpace(t))
+				if lower == "true" || lower == "1" || lower == "yes" {
+					return true, true
+				}
+				if lower == "false" || lower == "0" || lower == "no" {
+					return false, true
+				}
+			case float64:
+				return t != 0, true
+			}
+		}
+	}
+	return false, false
+}
+
+func filterNonEmpty(vals ...string) []string {
+	res := make([]string, 0, len(vals))
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if v != "" && v != "-" && v != "null" {
+			res = append(res, v)
+		}
+	}
+	return res
+}
+
+func normalizeGender(g string) string {
+	g = strings.ToLower(strings.TrimSpace(g))
+	switch g {
+	case "m", "male", "1":
+		return "male"
+	case "f", "female", "2":
+		return "female"
+	case "other", "o", "3":
+		return "other"
+	case "unknown", "u", "0":
+		return "unknown"
+	default:
+		if strings.HasPrefix(g, "m") {
+			return "male"
+		}
+		if strings.HasPrefix(g, "f") {
+			return "female"
+		}
+		return "unknown"
+	}
+}
+
+func normalizeDate(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexAny(s, "T "); i > 0 {
+		s = s[:i]
+	}
+	if len(s) >= 10 {
+		return s[:10]
+	}
+	return s
+}
+
+// normalizeViaGoogleFHIR validates the generated Patient JSON via google/fhir (R4)
+// by unmarshalling to the typed model. If valid, it returns the input unchanged.
+func normalizeViaGoogleFHIR(patientJSON []byte) ([]byte, error) {
+	um, err := jsonformat.NewUnmarshaller("UTC", fhirversion.R4)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := um.Unmarshal(patientJSON); err != nil {
+		return nil, err
+	}
+	return patientJSON, nil
 }
