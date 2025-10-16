@@ -28,7 +28,7 @@ func main() {
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	log.Println("FHIR proxy listening on :8080 (POST /fhir/Patient, GET/PUT/DELETE /fhir/Patient/{id})")
+	log.Println("FHIR proxy listening on :8080 (GET /fhir/Patient search by firstName, POST /fhir/Patient, GET/PUT/DELETE /fhir/Patient/{id})")
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

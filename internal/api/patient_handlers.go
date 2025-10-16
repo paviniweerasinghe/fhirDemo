@@ -168,10 +168,100 @@ func (d *PatientDeps) HandlePatientByID(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// HandleSearchPatients implements GET /fhir/Patient?firstName=...
+// It proxies to the backend search endpoint (same BaseURL with query params),
+// transforms each backend record to a FHIR Patient, validates it, and returns a Bundle searchset.
+func (d *PatientDeps) HandleSearchPatients(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Path != "/fhir/Patient" {
+		writeSimpleOutcome(w, http.StatusBadRequest, "invalid path for Patient search")
+		return
+	}
+	firstName := strings.TrimSpace(r.URL.Query().Get("firstName"))
+	if firstName == "" {
+		writeSimpleOutcome(w, http.StatusBadRequest, "missing required query parameter: firstName")
+		return
+	}
+	status, body, _, err := d.BE.SearchPatients(r.Context(), r.URL.Query(), r.Header)
+	if err != nil {
+		log.Printf("backend search error: %v", err)
+		writeSimpleOutcome(w, http.StatusBadGateway, "backend service unavailable")
+		return
+	}
+	if status < 200 || status >= 300 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+		return
+	}
+	// Backend returns an object with a "data" array. Each element may contain
+	// either a nested "details" object or a string field "data" holding JSON.
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		log.Printf("unexpected backend search payload (unmarshal envelope): %v", err)
+		writeSimpleOutcome(w, http.StatusBadGateway, "unexpected backend search payload")
+		return
+	}
+	itemsRaw, ok := envelope["data"].([]any)
+	if !ok {
+		// Some backends might return empty set as data: [] or data missing
+		itemsRaw = []any{}
+	}
+	entries := make([]map[string]any, 0, len(itemsRaw))
+	for _, it := range itemsRaw {
+		m, _ := it.(map[string]any)
+		var recBytes []byte
+		if m != nil {
+			if det, ok := m["details"].(map[string]any); ok {
+				recBytes, _ = json.Marshal(det)
+			} else if ds, ok := m["data"].(string); ok && ds != "" {
+				recBytes = []byte(ds)
+			}
+		}
+		if len(recBytes) == 0 {
+			continue
+		}
+		fhirBytes, err := fhir.TransformBackendToFHIRPatient(recBytes, "")
+		if err != nil {
+			log.Printf("transform failed for a record: %v", err)
+			continue // skip invalid records rather than failing the whole bundle
+		}
+		if err := fhir.ValidatePatientR4(fhirBytes); err != nil {
+			log.Printf("validation failed for a record: %v", err)
+			continue
+		}
+		var patient map[string]any
+		_ = json.Unmarshal(fhirBytes, &patient)
+		entries = append(entries, map[string]any{
+			"resource": patient,
+			"search":   map[string]any{"mode": "match"},
+		})
+	}
+	bundle := map[string]any{
+		"resourceType": "Bundle",
+		"type":         "searchset",
+		"total":        len(entries),
+		"entry":        entries,
+	}
+	w.Header().Set("Content-Type", "application/fhir+json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(bundle)
+}
+
 // Routes registers HTTP routes for Patient.
 func Routes(deps *PatientDeps) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/fhir/Patient", deps.HandleCreatePatient)
+	// Register search and create on the same path. Dispatch inside based on method and exact path.
+	mux.HandleFunc("/fhir/Patient", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fhir/Patient" {
+			deps.HandleSearchPatients(w, r)
+			return
+		}
+		deps.HandleCreatePatient(w, r)
+	})
 	mux.HandleFunc("/fhir/Patient/", deps.HandlePatientByID)
 	return mux
 }
