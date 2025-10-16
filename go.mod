@@ -2,10 +2,7 @@ module awesomeProject
 
 go 1.23
 
-require (
-	github.com/google/fhir/go v0.7.4
-	google.golang.org/protobuf v1.25.0
-)
+require github.com/google/fhir/go v0.7.4
 
 require (
 	bitbucket.org/creachadair/stringset v0.0.9 // indirect
@@ -15,6 +12,7 @@ require (
 	github.com/modern-go/reflect2 v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/serenize/snaker v0.0.0-20201027110005-a7ad2135616e // indirect
+	google.golang.org/protobuf v1.25.0 // indirect
 )
 
 replace github.com/golang/protobuf => github.com/golang/protobuf v1.4.3
